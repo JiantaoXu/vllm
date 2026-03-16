@@ -365,6 +365,8 @@ def fused_moe_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    even_Ks: tl.constexpr,
+    num_stages: tl.constexpr=3
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -401,12 +403,17 @@ def fused_moe_kernel(
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    if GROUP_SIZE_M > 1:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+    else:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+
 
     # ----------------------------------------------------------
     # Create pointers for the first blocks of A and B.
@@ -503,7 +510,7 @@ def fused_moe_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
     else:
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=num_stages):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
         a = tl.load(
@@ -511,7 +518,10 @@ def fused_moe_kernel(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if even_Ks:
+            b = tl.load(b_ptrs)
+        else:
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -792,6 +802,7 @@ def invoke_fused_moe_triton_kernel(
     config = config.copy()
     config["SPLIT_K"] = 1
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
+    even_Ks = (B.size(2) % BLOCK_SIZE_K == 0)
     if block_shape is not None:
         BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
     fused_moe_kernel[grid](
@@ -835,6 +846,7 @@ def invoke_fused_moe_triton_kernel(
         naive_block_assignment=(sorted_token_ids is None),
         HAS_BIAS=HAS_BIAS,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
+        even_Ks=even_Ks,
         **config,
     )
 
