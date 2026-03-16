@@ -363,7 +363,7 @@ def fused_moe_kernel(
     per_channel_quant: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     even_Ks: tl.constexpr,
-    num_stages: tl.constexpr=3
+    num_stages: tl.constexpr = 3
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -799,7 +799,7 @@ def invoke_fused_moe_triton_kernel(
     config = config.copy()
     config["SPLIT_K"] = 1
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
-    even_Ks = (B.size(2) % BLOCK_SIZE_K == 0)
+    even_Ks = B.size(2) % BLOCK_SIZE_K == 0
     if block_shape is not None:
         BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
     fused_moe_kernel[grid](
